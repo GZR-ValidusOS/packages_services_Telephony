@@ -21,6 +21,7 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.StatusBarManager;
 import android.content.ComponentName;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -35,6 +36,7 @@ import android.os.UserHandle;
 import android.os.UserManager;
 import android.preference.PreferenceManager;
 import android.provider.ContactsContract.PhoneLookup;
+import android.provider.Settings;
 import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
@@ -43,17 +45,18 @@ import android.telephony.PhoneNumberUtils;
 import android.telephony.ServiceState;
 import android.telephony.SubscriptionInfo;
 import android.telephony.SubscriptionManager;
-import android.telephony.SubscriptionManager.OnSubscriptionsChangedListener;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
 import android.util.ArrayMap;
 import android.util.Log;
 import android.widget.Toast;
+
 import com.android.internal.telephony.Phone;
 import com.android.internal.telephony.TelephonyCapabilities;
-import com.android.phone.settings.VoicemailNotificationSettingsUtil;
 import com.android.phone.settings.VoicemailSettingsActivity;
 import com.android.phone.vvm.omtp.sync.VoicemailStatusQueryHelper;
+import com.android.phone.settings.VoicemailNotificationSettingsUtil;
+
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
@@ -85,6 +88,10 @@ public class NotificationMgr {
     static final int SELECTED_OPERATOR_FAIL_NOTIFICATION = 6;
 
     static final int NOTIFICATION_ID_OFFSET = 50;
+
+    // notification light default constants
+    public static final int DEFAULT_COLOR = 0xFFFFFF; //White
+    public static final int DEFAULT_TIME = 1000; // 1 second
 
     /** The singleton NotificationMgr instance. */
     private static NotificationMgr sInstance;
@@ -133,27 +140,6 @@ public class NotificationMgr {
 
         mNotificationComponent = notificationComponent != null
                 ? ComponentName.unflattenFromString(notificationComponent) : null;
-
-        mSubscriptionManager.addOnSubscriptionsChangedListener(
-                new OnSubscriptionsChangedListener() {
-                    @Override
-                    public void onSubscriptionsChanged() {
-                        updateActivePhonesMwi();
-                    }
-                });
-    }
-
-    public void updateActivePhonesMwi() {
-        List<SubscriptionInfo> subInfos = mSubscriptionManager.getActiveSubscriptionInfoList();
-
-        if (subInfos == null) {
-            return;
-        }
-
-        for (int i = 0; i < subInfos.size(); i++) {
-            int subId = subInfos.get(i).getSubscriptionId();
-            refreshMwi(subId);
-        }
     }
 
     /**
@@ -174,6 +160,37 @@ public class NotificationMgr {
             return sInstance;
         }
     }
+
+    /**
+     * Configures a Notification to emit the blinky Voice mail
+     * signal.
+     */
+    private static void configureLedNotification(Context context, Notification notification) {
+        ContentResolver resolver = context.getContentResolver();
+
+        boolean lightEnabled = Settings.System.getInt(resolver,
+                Settings.System.NOTIFICATION_LIGHT_PULSE, 0) == 1;
+        if (!lightEnabled) {
+            return;
+        }
+
+        notification.flags |= Notification.FLAG_SHOW_LIGHTS;
+
+        // Get Voice mail values if they are to be used
+        boolean customEnabled = Settings.System.getInt(resolver,
+                Settings.System.NOTIFICATION_LIGHT_PULSE_CUSTOM_ENABLE, 0) == 1;
+        if (!customEnabled) {
+            notification.defaults |= Notification.DEFAULT_LIGHTS;
+            return;
+        }
+
+        notification.ledARGB = Settings.System.getInt(resolver,
+            Settings.System.NOTIFICATION_LIGHT_PULSE_VMAIL_COLOR, DEFAULT_COLOR);
+        notification.ledOnMS = Settings.System.getInt(resolver,
+            Settings.System.NOTIFICATION_LIGHT_PULSE_VMAIL_LED_ON, DEFAULT_TIME);
+        notification.ledOffMS = Settings.System.getInt(resolver,
+            Settings.System.NOTIFICATION_LIGHT_PULSE_VMAIL_LED_OFF, DEFAULT_TIME);
+     }
 
     /** The projection to use when querying the phones table */
     static final String[] PHONES_PROJECTION = new String[] {
@@ -246,13 +263,8 @@ public class NotificationMgr {
         if (visible && phone != null) {
             VoicemailStatusQueryHelper queryHelper = new VoicemailStatusQueryHelper(mContext);
             PhoneAccountHandle phoneAccount = PhoneUtils.makePstnPhoneAccountHandle(phone);
-            if (queryHelper.isVoicemailSourceConfigured(phoneAccount)) {
-                Log.v(LOG_TAG, "Source configured for visual voicemail, hiding mwi.");
-                // MWI may not be suppressed if the PIN is not set on VVM3 because it is also a
-                // "Not OK" configuration state. But VVM3 never send a MWI after the service is
-                // activated so this should be fine.
-                // TODO(twyen): once unbundled the client should be able to set a flag to suppress
-                // MWI, instead of letting the NotificationMgr try to interpret the states.
+            if (queryHelper.isNotificationsChannelActive(phoneAccount)) {
+                Log.v(LOG_TAG, "Notifications channel active for visual voicemail, hiding mwi.");
                 visible = false;
             }
         }
@@ -272,7 +284,14 @@ public class NotificationMgr {
                 return;
             }
 
-            int resId = android.R.drawable.stat_notify_voicemail;
+            int resId;
+            if (Settings.System.getInt(mContext.getContentResolver(),
+                Settings.System.KEY_VOICEMAIL_BREATH, 0) == 1) {
+                resId = R.drawable.stat_notify_voicemail_breath;
+            } else {
+                resId = android.R.drawable.stat_notify_voicemail;
+            }
+
             if (mTelephonyManager.getPhoneCount() > 1) {
                 resId = mwiIcon[phoneId];
             }
@@ -347,12 +366,12 @@ public class NotificationMgr {
             Uri ringtoneUri = null;
 
             if (enableNotificationSound) {
-                ringtoneUri = VoicemailNotificationSettingsUtil.getRingtoneUri(phone);
+                ringtoneUri = VoicemailNotificationSettingsUtil.getRingtoneUri(mPhone);
             }
 
             Resources res = mContext.getResources();
             PersistableBundle carrierConfig = PhoneGlobals.getInstance().getCarrierConfigForSubId(
-                    subId);
+                    mPhone.getSubId());
             Notification.Builder builder = new Notification.Builder(mContext);
             builder.setSmallIcon(resId)
                     .setWhen(System.currentTimeMillis())
@@ -379,6 +398,7 @@ public class NotificationMgr {
                         && !user.isManagedProfile()) {
                     if (!sendNotificationCustomComponent(vmCount, vmNumber, pendingIntent,
                             isSettingsIntent)) {
+                        configureLedNotification(mContext, notification);
                         mNotificationManager.notifyAsUser(
                                 Integer.toString(subId) /* tag */,
                                 notificationId,
@@ -532,14 +552,12 @@ public class NotificationMgr {
      * appears when you lose data connectivity because you're roaming and
      * you have the "data roaming" feature turned off.
      */
-    /* package */ void showDataDisconnectedRoaming(int roamingSlotId) {
+    /* package */ void showDataDisconnectedRoaming() {
         if (DBG) log("showDataDisconnectedRoaming()...");
 
         // "Mobile network settings" screen / dialog
         Intent intent = new Intent(mContext, com.android.phone.MobileNetworkSettings.class);
-        intent.putExtra(MobileNetworkSettings.EXTRA_INITIAL_SLOT_TAB , roamingSlotId);
-        PendingIntent contentIntent = PendingIntent.getActivity(mContext, 0, intent,
-                PendingIntent.FLAG_UPDATE_CURRENT);
+        PendingIntent contentIntent = PendingIntent.getActivity(mContext, 0, intent, 0);
 
         final CharSequence contentText = mContext.getText(R.string.roaming_reenable_message);
 
@@ -632,9 +650,8 @@ public class NotificationMgr {
         if (TelephonyCapabilities.supportsNetworkSelection(mPhone)) {
             int subId = mPhone.getSubId();
             int slotId = mPhone.getPhoneId();
-            int provisionStatus;
             final int PROVISIONED = 1;
-            final int INVALID_STATE = -1;
+            int provisionStatus = PROVISIONED;
             if (SubscriptionManager.isValidSubscriptionId(subId)) {
                 // get the shared preference of network_selection.
                 // empty is auto mode, otherwise it is the operator alpha name
@@ -655,10 +672,8 @@ public class NotificationMgr {
                     //get current provision state of the SIM.
                     provisionStatus = mExtTelephony.getCurrentUiccCardProvisioningStatus(slotId);
                 } catch (RemoteException ex) {
-                    provisionStatus = INVALID_STATE;
                     if (DBG) log("Failed to get status for slotId: "+ slotId +" Exception: " + ex);
                 } catch (NullPointerException ex) {
-                    provisionStatus = INVALID_STATE;
                     if (DBG) log("Failed to get status for slotId: "+ slotId +" Exception: " + ex);
                 }
 
